@@ -1,5 +1,7 @@
 # Walmart M5 Sales Forecasting: Time Series Analysis
 
+[![Live Report](https://img.shields.io/badge/Live%20Report-View%20Here-brightgreen?style=for-the-badge)](https://suin8606.github.io/walmart-ts-forecasting/walmart_ts.html)
+
 ![R](https://img.shields.io/badge/R-276DC3?style=for-the-badge&logo=r&logoColor=white)
 ![RMarkdown](https://img.shields.io/badge/RMarkdown-276DC3?style=for-the-badge&logo=r&logoColor=white)
 ![ggplot2](https://img.shields.io/badge/ggplot2-1A162D?style=for-the-badge&logo=r&logoColor=white)
