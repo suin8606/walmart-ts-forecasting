@@ -1,0 +1,11 @@
+install.packages(c(
+  "data.table",
+  "dplyr",
+  "ggplot2",
+  "tidyr",
+  "forecast",
+  "astsa",
+  "tseries",
+  "Metrics",
+  "lubridate"
+))

@@ -1,0 +1,15 @@
+# Large data files — download from Kaggle
+*.csv
+data/
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knitted output (remove if you want to commit HTML)
+# *.html
+
+# Mac
+.DS_Store

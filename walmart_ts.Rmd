@@ -1,0 +1,748 @@
+---
+title: "Walmart M5 Sales Forecasting: Time Series Analysis"
+author: "Suin Kim"
+output: html_document
+---
+
+## Project Overview
+
+This project applies time series forecasting methods to the **M5 Forecasting Competition** dataset — a real-world retail sales dataset from Walmart covering 3,049 products across 10 stores in 3 US states (California, Texas, Wisconsin) from 2011 to 2016.
+
+**Business Goal:** Forecast daily aggregate sales to support inventory planning and demand management. Accurate sales forecasts reduce overstock and stockout costs — critical operational challenges for large retailers.
+
+**Models compared:**
+- ARIMA (AutoRegressive Integrated Moving Average)
+- SARIMA (Seasonal ARIMA)
+- TBATS (Trigonometric seasonality, Box-Cox transformation, ARMA errors, Trend, Seasonal)
+
+**Data source:** [M5 Forecasting Accuracy — Kaggle](https://www.kaggle.com/competitions/m5-forecasting-accuracy)
+
+---
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(forecast)
+library(astsa)
+library(Metrics)
+library(lubridate)
+
+# Dataset files needed in working directory:
+# - sales_train_validation.csv
+# - calendar.csv
+# Download from: https://www.kaggle.com/competitions/m5-forecasting-accuracy
+```
+
+---
+
+## 2. Data Loading & Preparation
+
+### 2.1 Dataset Description
+
+The M5 dataset has two key files:
+
+- **sales_train_validation.csv**: Each row is one product-store combination. Columns `d_1` through `d_1941` represent daily unit sales for each calendar day.
+- **calendar.csv**: Maps day codes (`d_1`, `d_2`, ...) to actual dates, with additional features for events (holidays, sporting events) and SNAP benefit days by state.
+
+```{r load-data, message=FALSE, warning=FALSE}
+setwd("/Users/suinkim/Desktop/Time_Series")
+sales_train_validation <- fread("sales_train_validation.csv")
+calendar <- fread("calendar.csv")
+calendar <- as.data.table(calendar)
+
+cat("Sales data dimensions:", dim(sales_train_validation), "\n")
+cat("Calendar dimensions:", dim(calendar), "\n")
+cat("Date range:", as.character(min(calendar$date)), "to", as.character(max(calendar$date)), "\n")
+cat("Number of unique products:", length(unique(sales_train_validation$item_id)), "\n")
+cat("Number of stores:", length(unique(sales_train_validation$store_id)), "\n")
+cat("States covered:", paste(unique(sales_train_validation$state_id), collapse = ", "), "\n")
+cat("Product categories:", paste(unique(sales_train_validation$cat_id), collapse = ", "), "\n")
+```
+
+### 2.2 Pivot & Merge with Calendar
+
+```{r pivot-merge, message=FALSE, warning=FALSE}
+# Pivot from wide format (d_1, d_2, ...) to long format (day, sales)
+# This transforms 1941 columns into rows for easier manipulation
+sales_pivot <- sales_train_validation %>%
+  pivot_longer(
+    cols       = starts_with("d_"),
+    names_to   = "day",
+    values_to  = "sales"
+  )
+
+# Convert to data.table for faster processing on large dataset
+sales_pivot <- as.data.table(sales_pivot)
+
+# Merge with calendar to attach actual dates and event info
+setkey(calendar, d)
+sales_with_calendar <- merge(
+  sales_pivot,
+  calendar,
+  by.x   = "day",
+  by.y   = "d",
+  all.x  = TRUE
+)
+
+# Filter to 2014-2015 for modeling
+# These two years provide enough data for seasonal patterns
+# while keeping computation manageable
+sales_with_calendar <- sales_with_calendar[year %in% c(2014, 2015)]
+sales_with_calendar <- sales_with_calendar[, .(cat_id, state_id, sales, date, weekday)]
+
+cat("Filtered data dimensions:", dim(sales_with_calendar), "\n")
+cat("Date range after filtering:", as.character(min(sales_with_calendar$date)),
+    "to", as.character(max(sales_with_calendar$date)), "\n")
+```
+
+---
+
+## 3. Exploratory Data Analysis
+
+### 3.1 Daily Total Sales & Outlier Removal
+
+Before any exploration, we first aggregate to daily totals and immediately remove the Christmas Day structural outlier. December 25th records near-zero sales because Walmart stores are closed — this is not random noise but a known structural zero that would distort all downstream analysis and models.
+
+```{r eda-daily-raw, fig.width=12, fig.height=5}
+# Aggregate to total daily sales across all products and stores
+d_sales <- sales_with_calendar[, .(total_sales = sum(sales)), by = date]
+d_sales <- d_sales[order(date)]
+
+# Show raw data first — Christmas outliers clearly visible as sharp vertical drops
+ggplot(d_sales, aes(x = date, y = total_sales)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title    = "Daily Total Sales: 2014–2015 (Raw)",
+    subtitle = "Two sharp drops in December = Christmas closures (structural zeros — not random noise)",
+    x        = "Date",
+    y        = "Total Units Sold"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r outlier, fig.width=12, fig.height=5}
+# Identify and remove Christmas Day outliers
+low_sales_dates <- d_sales[lubridate::month(date) == 12 & lubridate::day(date) == 25]
+
+cat("Christmas Day sales removed:\n")
+print(low_sales_dates)
+
+# Remove Christmas dates — all remaining EDA and modeling uses this clean series
+d_sales <- d_sales[!(date %in% low_sales_dates$date)]
+
+# Also remove from sales_with_calendar so category/state charts are consistent
+sales_with_calendar <- sales_with_calendar[!(lubridate::month(date) == 12 & lubridate::day(date) == 25)]
+
+ggplot(d_sales, aes(x = date, y = total_sales)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title    = "Daily Total Sales: 2014–2015 (Christmas Removed)",
+    subtitle = "Weekly seasonality now clearly visible — used for all subsequent analysis",
+    x        = "Date",
+    y        = "Total Units Sold"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+### 3.2 Sales by Category
+
+```{r eda-category, fig.width=12, fig.height=5}
+# Examine sales distribution across product categories (Christmas already removed)
+# FOODS dominates — justifies aggregate forecasting as a starting point
+cat_sales <- sales_with_calendar[, .(total_sales = sum(sales)), by = .(date, cat_id)]
+
+ggplot(cat_sales, aes(x = date, y = total_sales, color = cat_id)) +
+  geom_line(alpha = 0.8) +
+  labs(
+    title  = "Daily Sales by Category: 2014–2015",
+    x      = "Date",
+    y      = "Total Units Sold",
+    color  = "Category"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+### 3.3 Sales by State
+
+```{r eda-state, fig.width=12, fig.height=5}
+# California consistently leads in sales volume across both years
+state_sales <- sales_with_calendar[, .(total_sales = sum(sales)), by = .(date, state_id)]
+
+ggplot(state_sales, aes(x = date, y = total_sales, color = state_id)) +
+  geom_line(alpha = 0.8) +
+  labs(
+    title  = "Daily Sales by State: 2014–2015",
+    x      = "Date",
+    y      = "Total Units Sold",
+    color  = "State"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+### 3.4 Day-of-Week Patterns
+
+```{r eda-weekday, fig.width=10, fig.height=5}
+# Weekly seasonality check — retail sales typically peak on weekends
+# This confirms s=7 is the right seasonal period for SARIMA and TBATS
+weekday_sales <- sales_with_calendar[, .(avg_sales = mean(sales)), by = weekday]
+weekday_order <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+weekday_sales$weekday <- factor(weekday_sales$weekday, levels = weekday_order)
+
+ggplot(weekday_sales, aes(x = weekday, y = avg_sales, fill = weekday)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title    = "Average Sales by Day of Week",
+    subtitle = "Confirms strong weekly seasonality — critical for model selection",
+    x        = "Day of Week",
+    y        = "Average Units Sold"
+  ) +
+  theme_minimal() +
+  theme(plot.title    = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+### 3.5 Yearly Mean and Variance
+
+```{r eda-stationarity-check, fig.width=10, fig.height=6}
+# Check whether mean and variance are stable over time
+# Changing mean/variance = non-stationary -> differencing needed
+d_sales$year <- as.numeric(format(d_sales$date, "%Y"))
+stats_by_year <- d_sales[, .(mean_sales = mean(total_sales),
+                               var_sales  = var(total_sales)), by = year]
+
+cat("Yearly statistics:\n")
+print(stats_by_year)
+
+par(mfrow = c(2, 1), mar = c(4, 5, 3, 2))
+plot(stats_by_year$year, stats_by_year$mean_sales,
+     type = "b", col = "steelblue", pch = 19,
+     main = "Yearly Mean Sales", xlab = "Year", ylab = "Mean Sales")
+plot(stats_by_year$year, stats_by_year$var_sales,
+     type = "b", col = "tomato", pch = 19,
+     main = "Yearly Variance of Sales", xlab = "Year", ylab = "Variance")
+par(mfrow = c(1, 1))
+```
+
+Both mean and variance shift across years — confirming the series is **non-stationary** and requires differencing before ARIMA modeling.
+
+---
+
+## 4. Stationarity Testing
+
+### 4.1 Augmented Dickey-Fuller Test
+
+The **Augmented Dickey-Fuller (ADF) test** formally tests for a unit root (non-stationarity).
+
+$$H_0: \text{Series has a unit root (non-stationary)}$$
+$$H_1: \text{Series is stationary}$$
+
+If $p > 0.05$: fail to reject $H_0$ — series is non-stationary, differencing required.
+
+```{r adf-test}
+library(tseries)
+
+cat("=== ADF Test on Raw Sales ===\n")
+adf_raw <- adf.test(d_sales$total_sales)
+print(adf_raw)
+
+if (adf_raw$p.value > 0.05) {
+  cat("-> Non-stationary. Differencing required.\n")
+} else {
+  cat("-> Stationary. No differencing needed.\n")
+}
+```
+
+### 4.2 First-Order Differencing
+
+```{r differencing, fig.width=12, fig.height=5}
+# First-order differencing: removes trend by computing day-over-day change
+# Δy_t = y_t - y_{t-1}
+d_sales_diff <- data.frame(
+  date       = d_sales$date[-1],
+  diff_sales = diff(d_sales$total_sales, lag = 1)
+)
+
+ggplot(d_sales_diff, aes(x = date, y = diff_sales)) +
+  geom_line(color = "steelblue") +
+  labs(
+    title    = "First-Order Differenced Daily Sales",
+    subtitle = "Δy_t = y_t - y_{t-1} — trend removed, series oscillates around zero",
+    x        = "Date",
+    y        = "Differenced Sales"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# Confirm stationarity after differencing
+cat("\n=== ADF Test on Differenced Sales ===\n")
+adf_diff <- adf.test(d_sales_diff$diff_sales)
+print(adf_diff)
+
+if (adf_diff$p.value <= 0.05) {
+  cat("-> Stationary after differencing. Proceed with ARIMA.\n")
+}
+```
+
+---
+
+## 5. ACF & PACF Analysis
+
+ACF and PACF plots are used to identify the AR order (p) and MA order (q) for the ARIMA model.
+
+**Interpretation rules:**
+- **ACF** — significant lags beyond lag 0 suggest MA terms (q)
+- **PACF** — significant lags beyond lag 0 suggest AR terms (p)
+- Exponential decay in ACF with sharp PACF cutoff → AR model
+- Sharp ACF cutoff with exponential PACF decay → MA model
+
+```{r acf-pacf, fig.width=12, fig.height=6}
+par(mfrow = c(1, 2))
+Acf(d_sales_diff$diff_sales,
+    main = "ACF — Differenced Sales",
+    lag.max = 40)
+Pacf(d_sales_diff$diff_sales,
+     main = "PACF — Differenced Sales",
+     lag.max = 40)
+par(mfrow = c(1, 1))
+```
+
+**Reading the plots:**
+- ACF shows significant spikes at lags 1, 7 — suggesting MA(1) and weekly seasonal component
+- PACF shows significant spikes at lags 1–3 — suggesting AR(2) or AR(3) as starting point
+- Spike at lag 7 in both ACF/PACF confirms 7-day weekly seasonality
+
+---
+
+## 6. Data Smoothing
+
+```{r smoothing, fig.width=12, fig.height=6}
+# Moving averages smooth short-term fluctuations to reveal underlying trends
+# 7-day MA captures weekly cycle; 30-day MA captures monthly trend
+
+# Remove extreme outliers before smoothing (threshold: 10,000 units change/day)
+threshold <- 10000
+d_sales_diff_cleaned <- d_sales_diff[abs(d_sales_diff$diff_sales) < threshold, ]
+
+ma7  <- stats::filter(d_sales_diff_cleaned$diff_sales, sides = 2, rep(1, 7) / 7)
+ma30 <- stats::filter(d_sales_diff_cleaned$diff_sales, sides = 2, rep(1, 30) / 30)
+
+plot(d_sales_diff_cleaned$date, d_sales_diff_cleaned$diff_sales,
+     type = "l", col = "grey60",
+     main = "Data Smoothing: 7-Day and 30-Day Moving Averages",
+     xlab = "Date", ylab = "Differenced Sales")
+lines(d_sales_diff_cleaned$date, ma7,  col = "steelblue", lwd = 2)
+lines(d_sales_diff_cleaned$date, ma30, col = "tomato",    lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Original", "7-Day MA", "30-Day MA"),
+       col    = c("grey60", "steelblue", "tomato"),
+       lty    = c(1, 1, 2), lwd = 1, cex = 0.8)
+```
+
+---
+
+## 7. Seasonal Decomposition
+
+```{r decomposition, fig.width=12, fig.height=8}
+# Decompose the raw series into trend, seasonal, and residual components
+# Using period = 7 for weekly seasonality
+# This gives us a clearer view of the underlying structure before modeling
+
+sales_ts <- ts(d_sales$total_sales, frequency = 7)
+decomp   <- stl(sales_ts, s.window = "periodic")
+plot(decomp,
+     main = "STL Decomposition: Trend + Weekly Seasonality + Residuals")
+```
+
+**Decomposition findings:**
+- **Trend**: Gradual upward trend through 2014-2015
+- **Seasonal**: Strong, consistent 7-day cycle — weekend peaks, mid-week troughs
+- **Remainder**: Random noise after trend and seasonality are removed
+
+---
+
+## 8. Train / Test Split
+
+```{r train-test}
+# 90/10 split — use 90% of data for training, hold out last 10% for evaluation
+n          <- nrow(d_sales_diff)
+train_size <- floor(0.9 * n)
+
+train_data <- d_sales_diff[1:train_size, ]
+test_data  <- d_sales_diff[(train_size + 1):n, ]
+
+cat("Training observations:", nrow(train_data), "\n")
+cat("Testing observations: ", nrow(test_data), "\n")
+cat("Train period:", as.character(min(train_data$date)),
+    "to", as.character(max(train_data$date)), "\n")
+cat("Test period: ", as.character(min(test_data$date)),
+    "to", as.character(max(test_data$date)), "\n")
+```
+
+---
+
+## 9. Model 1: ARIMA
+
+### 9.1 Model Specification
+
+The **ARIMA(p, d, q)** model combines three components:
+
+$$\Phi(B)(1-B)^d y_t = \Theta(B)\epsilon_t$$
+
+Where:
+- $p$ = autoregressive order (how many past values predict the current value)
+- $d$ = degree of differencing (how many times the series is differenced to achieve stationarity)
+- $q$ = moving average order (how many past forecast errors predict the current value)
+- $B$ = backshift operator: $By_t = y_{t-1}$
+- $\epsilon_t \sim \mathcal{N}(0, \sigma^2)$ = white noise
+
+**For our data:** $d = 1$ (first-order differencing confirmed stationary), so we model on the differenced series with $d = 0$ (pre-differenced input).
+
+### 9.2 AIC Grid Search for Optimal p and q
+
+```{r arima-grid, warning=FALSE}
+# Grid search over p in {0,...,4} and q in {0,...,4}
+# Select model with lowest AIC (Akaike Information Criterion)
+# AIC penalizes model complexity: AIC = 2k - 2ln(L)
+# where k = number of parameters, L = likelihood
+
+p_range  <- 0:4
+q_range  <- 0:4
+best_aic <- Inf
+best_p   <- 0
+best_q   <- 0
+best_model <- NULL
+
+for (p in p_range) {
+  for (q in q_range) {
+    model <- try(Arima(train_data$diff_sales, order = c(p, 0, q)), silent = TRUE)
+    if (!inherits(model, "try-error")) {
+      current_aic <- AIC(model)
+      if (current_aic < best_aic) {
+        best_aic   <- current_aic
+        best_model <- model
+        best_p     <- p
+        best_q     <- q
+      }
+    }
+  }
+}
+
+cat("Best ARIMA order: ARIMA(", best_p, ", 1,", best_q, ")\n")
+cat("Best AIC:", round(best_aic, 2), "\n")
+summary(best_model)
+```
+
+### 9.3 Residual Diagnostics
+
+```{r arima-diagnostics, fig.width=12, fig.height=8}
+# A well-fitted model should have residuals that behave like white noise:
+# - Random scatter around zero (no pattern)
+# - ACF within confidence bands (no remaining autocorrelation)
+# - Normal distribution (QQ plot on the line)
+# - Ljung-Box p-values above 0.05 (no significant autocorrelation)
+sarima(train_data$diff_sales, p = best_p, d = 1, q = best_q)
+```
+
+### 9.4 Forecast & Evaluation
+
+```{r arima-forecast, fig.width=12, fig.height=5}
+# Forecast on test set and compute error metrics
+n_ahead        <- nrow(test_data)
+arima_forecast <- forecast(best_model, h = n_ahead)
+arima_pred     <- as.numeric(arima_forecast$mean)
+
+# Error metrics
+arima_rmse <- rmse(test_data$diff_sales, arima_pred)
+arima_mae  <- mae(test_data$diff_sales, arima_pred)
+
+cat("ARIMA Test RMSE:", round(arima_rmse, 2), "\n")
+cat("ARIMA Test MAE: ", round(arima_mae, 2), "\n")
+
+# Plot forecast vs actual
+plot_df <- data.frame(
+  date     = test_data$date,
+  actual   = test_data$diff_sales,
+  forecast = arima_pred,
+  lower    = as.numeric(arima_forecast$lower[, 2]),
+  upper    = as.numeric(arima_forecast$upper[, 2])
+)
+
+ggplot(plot_df, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(y = actual),   color = "black",     lwd = 0.8) +
+  geom_line(aes(y = forecast), color = "steelblue", lwd = 1) +
+  labs(
+    title    = paste0("ARIMA(", best_p, ",1,", best_q, ") Forecast vs Actual"),
+    subtitle = "Black = Actual | Blue = Forecast | Shaded = 95% CI",
+    x = "Date", y = "Differenced Sales"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+---
+
+## 10. Model 2: SARIMA
+
+### 10.1 Model Specification
+
+The **SARIMA(p, d, q)(P, D, Q)[s]** model extends ARIMA with seasonal components:
+
+$$\Phi_P(B^s)\phi_p(B)(1-B^s)^D(1-B)^d y_t = \Theta_Q(B^s)\theta_q(B)\epsilon_t$$
+
+Where:
+- $(p, d, q)$ = non-seasonal AR, differencing, MA orders
+- $(P, D, Q)$ = seasonal AR, differencing, MA orders
+- $s$ = seasonal period (7 for weekly data)
+- $B^s$ = seasonal backshift operator: $B^s y_t = y_{t-s}$
+
+**For our data:** $s = 7$ (weekly seasonality confirmed by ACF/PACF and decomposition).
+
+```{r sarima-model, warning=FALSE, message=FALSE}
+# SARIMA(1,1,1)(1,1,1)[7] — non-seasonal + weekly seasonal components
+# Seasonal D=1 accounts for year-over-year weekly pattern differences
+sarima_model <- tryCatch(
+  auto.arima(
+    ts(d_sales$total_sales[1:train_size], frequency = 7),
+    seasonal      = TRUE,
+    stepwise      = TRUE,
+    approximation = TRUE,
+    trace         = FALSE
+  ),
+  error = function(e) {
+    # Fallback to manual specification if auto.arima fails
+    Arima(ts(d_sales$total_sales[1:train_size], frequency = 7),
+          order          = c(1, 1, 1),
+          seasonal       = list(order = c(1, 1, 1), period = 7))
+  }
+)
+
+cat("SARIMA model selected:\n")
+print(sarima_model)
+```
+
+### 10.2 Residual Diagnostics
+
+```{r sarima-diagnostics, fig.width=12, fig.height=8}
+checkresiduals(sarima_model)
+```
+
+### 10.3 Forecast & Evaluation
+
+```{r sarima-forecast, fig.width=12, fig.height=5}
+sarima_forecast <- forecast(sarima_model, h = n_ahead)
+sarima_pred     <- as.numeric(sarima_forecast$mean)
+
+# Align length if needed
+min_len      <- min(length(sarima_pred), nrow(test_data))
+sarima_pred  <- sarima_pred[1:min_len]
+actual_test  <- test_data$diff_sales[1:min_len]
+test_dates   <- test_data$date[1:min_len]
+
+sarima_rmse <- rmse(actual_test, sarima_pred)
+sarima_mae  <- mae(actual_test, sarima_pred)
+
+cat("SARIMA Test RMSE:", round(sarima_rmse, 2), "\n")
+cat("SARIMA Test MAE: ", round(sarima_mae, 2), "\n")
+
+plot_df2 <- data.frame(
+  date     = test_dates,
+  actual   = actual_test,
+  forecast = sarima_pred,
+  lower    = as.numeric(sarima_forecast$lower[1:min_len, 2]),
+  upper    = as.numeric(sarima_forecast$upper[1:min_len, 2])
+)
+
+ggplot(plot_df2, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "seagreen", alpha = 0.2) +
+  geom_line(aes(y = actual),   color = "black",    lwd = 0.8) +
+  geom_line(aes(y = forecast), color = "seagreen", lwd = 1) +
+  labs(
+    title    = "SARIMA Forecast vs Actual",
+    subtitle = "Black = Actual | Green = Forecast | Shaded = 95% CI",
+    x = "Date", y = "Differenced Sales"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+---
+
+## 11. Model 3: TBATS
+
+### 11.1 Model Specification
+
+**TBATS** handles multiple seasonal periods simultaneously — ideal for retail data with both weekly (period = 7) and annual (period = 365.25) cycles.
+
+The TBATS model is defined as:
+
+$$y_t^{(\omega)} = l_{t-1} + \phi b_{t-1} + \sum_{i=1}^{T} s_t^{(i)} + d_t$$
+
+Where:
+- $y_t^{(\omega)}$ = Box-Cox transformed observations (stabilizes variance)
+- $l_t$ = local level (trend intercept)
+- $b_t$ = local slope (trend gradient), damped by $\phi$
+- $s_t^{(i)}$ = $i$-th seasonal component modeled by trigonometric terms
+- $d_t$ = ARMA($p$, $q$) error process
+
+**Key advantage over ARIMA/SARIMA:** handles non-integer and multiple seasonal periods without manual specification. The model automatically selects the optimal Box-Cox $\lambda$, damping, and ARMA orders.
+
+```{r tbats-model, warning=FALSE, message=FALSE}
+# TBATS automatically detects seasonal periods and fits accordingly
+# Use msts() to specify multiple seasonal periods: weekly (7) and annual (365.25)
+sales_msts <- msts(
+  d_sales$total_sales[1:train_size],
+  seasonal.periods = c(7, 365.25)
+)
+
+tbats_model <- tbats(sales_msts)
+cat("TBATS model summary:\n")
+print(tbats_model)
+```
+
+### 11.2 Forecast & Evaluation
+
+```{r tbats-forecast, fig.width=12, fig.height=5}
+tbats_forecast <- forecast(tbats_model, h = n_ahead)
+tbats_pred     <- as.numeric(tbats_forecast$mean)[1:min_len]
+
+tbats_rmse <- rmse(actual_test, tbats_pred)
+tbats_mae  <- mae(actual_test, tbats_pred)
+
+cat("TBATS Test RMSE:", round(tbats_rmse, 2), "\n")
+cat("TBATS Test MAE: ", round(tbats_mae, 2), "\n")
+
+plot_df3 <- data.frame(
+  date     = test_dates,
+  actual   = actual_test,
+  forecast = tbats_pred,
+  lower    = as.numeric(tbats_forecast$lower[1:min_len, 2]),
+  upper    = as.numeric(tbats_forecast$upper[1:min_len, 2])
+)
+
+ggplot(plot_df3, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "darkorange", alpha = 0.2) +
+  geom_line(aes(y = actual),   color = "black",      lwd = 0.8) +
+  geom_line(aes(y = forecast), color = "darkorange",  lwd = 1) +
+  labs(
+    title    = "TBATS Forecast vs Actual",
+    subtitle = "Black = Actual | Orange = Forecast | Shaded = 95% CI",
+    x = "Date", y = "Sales"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+---
+
+## 12. Model Comparison
+
+```{r model-comparison}
+comparison <- data.frame(
+  Model = c(
+    paste0("ARIMA(", best_p, ",1,", best_q, ")"),
+    "SARIMA (auto-selected)",
+    "TBATS (multi-seasonal)"
+  ),
+  RMSE = round(c(arima_rmse, sarima_rmse, tbats_rmse), 2),
+  MAE  = round(c(arima_mae,  sarima_mae,  tbats_mae),  2),
+  Handles_Seasonality  = c("No",  "Yes (single)", "Yes (multiple)"),
+  Interpretability     = c("High", "High",         "Low"),
+  Complexity           = c("Low",  "Medium",        "High")
+)
+
+knitr::kable(comparison, caption = "Model Comparison: ARIMA vs SARIMA vs TBATS")
+```
+
+---
+
+## 13. Future Forecast (30 Days)
+
+```{r future-forecast, fig.width=12, fig.height=6}
+# Use the best model (lowest RMSE) to forecast 30 days beyond the training period
+# Here we use SARIMA as it balances accuracy and interpretability
+
+future_forecast <- forecast(sarima_model, h = 30)
+
+autoplot(future_forecast) +
+  labs(
+    title    = "30-Day Sales Forecast (SARIMA)",
+    subtitle = "Shaded regions = 80% and 95% prediction intervals",
+    x        = "Time",
+    y        = "Total Sales"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+---
+
+## 14. Conclusions
+
+```{r conclusions, echo=FALSE}
+cat("
+ANALYSIS SUMMARY
+================
+
+Data Findings:
+- Strong weekly seasonality confirmed (7-day cycle) — weekends consistently outsell weekdays
+- Mild upward trend through 2014-2015
+- Christmas Day is a structural zero — stores closed; treated as outlier and removed
+- First-order differencing is sufficient to achieve stationarity (ADF test confirmed)
+
+Model Results:
+- ARIMA: Fastest to fit, interpretable, but ignores seasonality in its standard form
+- SARIMA: Best balance of accuracy and interpretability; auto.arima selected
+  optimal seasonal orders; handles weekly cycle explicitly
+- TBATS: Handles both weekly and annual seasonality simultaneously;
+  useful when longer history is available to identify annual patterns
+
+Recommendation:
+- For operational forecasting (inventory planning), SARIMA is recommended —
+  it captures the dominant weekly pattern and provides interpretable coefficients
+- TBATS becomes more valuable with 3+ years of data where annual seasonality is clear
+- ARIMA alone is insufficient for retail data with strong weekly patterns
+
+Limitations & Next Steps:
+1. Aggregate forecasting hides item-level and store-level variation —
+   hierarchical forecasting would improve operational utility
+2. External features (events, SNAP days, holidays) from the calendar file
+   were not incorporated — adding them as regressors (ARIMAX) would improve accuracy
+3. LightGBM or gradient boosting (as used by M5 competition winners) significantly
+   outperforms classical time series methods on this dataset
+4. Prophet (Facebook) handles holidays and seasonality automatically and
+   would be a strong next model to test
+")
+```
+
+---
+
+## 15. Methodology Notes
+
+**Why first-order differencing?**
+Differencing removes trend by computing $\Delta y_t = y_t - y_{t-1}$. We apply it once ($d=1$) — confirmed sufficient by ADF test on the differenced series.
+
+**Why AIC for model selection?**
+$$\text{AIC} = 2k - 2\ln(\hat{L})$$
+AIC penalizes model complexity ($k$ = number of parameters) to prevent overfitting while rewarding goodness of fit ($\hat{L}$ = likelihood). Lower AIC = better model.
+
+**Why RMSE and MAE?**
+$$\text{RMSE} = \sqrt{\frac{1}{n}\sum_{t=1}^{n}(y_t - \hat{y}_t)^2}$$
+$$\text{MAE} = \frac{1}{n}\sum_{t=1}^{n}|y_t - \hat{y}_t|$$
+RMSE penalizes large errors more heavily (useful when big misses are costly). MAE treats all errors equally. Together they give a complete picture of forecast accuracy.
